@@ -24,13 +24,26 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-CONDA_SEARCH_PATHS = [
-    "~/miniconda3/envs",
-    "~/anaconda3/envs",
-    "/opt/conda/envs",
-    "/home/*/miniconda3/envs",
-    "/home/*/anaconda3/envs",
-]
+if sys.platform == "win32":
+    CONDA_SEARCH_PATHS = [
+        "~/miniconda3/envs",
+        "~/anaconda3/envs",
+        "~/miniconda3/Lib/site-packages",  # some installs
+        "C:/ProgramData/miniconda3/envs",
+        "C:/ProgramData/anaconda3/envs",
+        "C:/Miniconda3/envs",
+        "C:/Anaconda3/envs",
+        "C:/Users/*/miniconda3/envs",
+        "C:/Users/*/anaconda3/envs",
+    ]
+else:
+    CONDA_SEARCH_PATHS = [
+        "~/miniconda3/envs",
+        "~/anaconda3/envs",
+        "/opt/conda/envs",
+        "/home/*/miniconda3/envs",
+        "/home/*/anaconda3/envs",
+    ]
 
 MAX_LOG_LINES = 2000  # 每个任务保留的最大日志行数
 
@@ -516,17 +529,31 @@ async def list_conda_envs():
 
     for search_path in CONDA_SEARCH_PATHS:
         expanded = str(search_path).replace("~", str(home))
-        p = Path(expanded)
-        if p.is_dir():
+        # 展开通配符
+        if "*" in expanded:
+            import glob as _glob
+            candidates = _glob.glob(expanded)
+        else:
+            candidates = [expanded]
+
+        for candidate in candidates:
+            p = Path(candidate)
+            if not p.is_dir():
+                continue
             for env_dir in sorted(p.iterdir()):
-                if env_dir.is_dir():
-                    python_bin = env_dir / "bin" / "python"
-                    if python_bin.is_file():
-                        envs.append({
-                            "name": env_dir.name,
-                            "path": str(env_dir),
-                            "python_path": str(python_bin),
-                        })
+                if not env_dir.is_dir():
+                    continue
+                # 平台相关的 python 路径
+                if sys.platform == "win32":
+                    python_exe = env_dir / "python.exe"
+                else:
+                    python_exe = env_dir / "bin" / "python"
+                if python_exe.is_file():
+                    envs.append({
+                        "name": env_dir.name,
+                        "path": str(env_dir),
+                        "python_path": str(python_exe),
+                    })
 
     # 当前Python环境
     envs.insert(0, {
@@ -542,7 +569,34 @@ async def list_conda_envs():
 @app.get("/api/browse")
 async def browse_filesystem(path: str = Query(default="")):
     if not path:
-        path = str(Path.home())
+        if sys.platform == "win32":
+            # Windows: 列出可用驱动器
+            import string as _string
+            drives = []
+            import ctypes
+            try:
+                # 使用 GetLogicalDrives 获取可用驱动器
+                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+                for letter in _string.ascii_uppercase:
+                    if bitmask & (1 << (ord(letter) - ord("A"))):
+                        drive_path = f"{letter}:\\"
+                        drives.append({"name": f"本地磁盘 ({letter}:)", "path": drive_path})
+            except Exception:
+                # 回退：检查常见驱动器是否存在
+                for letter in _string.ascii_uppercase:
+                    drive_path = f"{letter}:\\"
+                    if Path(drive_path).exists():
+                        drives.append({"name": f"本地磁盘 ({letter}:)", "path": drive_path})
+
+            return {
+                "current": "",
+                "parent": None,
+                "dirs": drives,
+                "files": [],
+                "is_drives": True,
+            }
+        else:
+            path = str(Path.home())
     elif path.startswith("~"):
         path = str(Path(path).expanduser())
 
@@ -551,10 +605,6 @@ async def browse_filesystem(path: str = Query(default="")):
         return {"error": "路径不存在", "path": path}
     if not p.is_dir():
         return {"error": "不是目录", "path": str(p)}
-
-    # 安全限制：不允许浏览系统敏感目录
-    if sys.platform != "win32" and str(p) in ("/", "/root", "/etc", "/sys", "/proc", "/dev"):
-        pass  # 允许浏览，但前端会提示
 
     dirs = []
     files = []
@@ -570,13 +620,23 @@ async def browse_filesystem(path: str = Query(default="")):
     except PermissionError:
         return {"error": "无权限访问", "path": str(p)}
 
-    parent = str(p.parent) if str(p) != str(Path.home().anchor) else None
+    # 计算父目录：Windows 下盘符根目录的 parent 指向驱动器列表
+    if sys.platform == "win32":
+        parent_path = str(p.parent)
+        # 盘符根目录 (如 C:\) — parent 返回空串，回到驱动器列表
+        if parent_path == str(p):
+            parent = ""
+        else:
+            parent = parent_path
+    else:
+        parent = str(p.parent) if str(p) != str(Path.home().anchor) else None
 
     return {
         "current": str(p),
         "parent": parent,
         "dirs": dirs,
         "files": files,
+        "is_drives": False,
     }
 
 
@@ -1120,36 +1180,47 @@ async function navigateFileBrowser(path) {
     return;
   }
   fileBrowserPath = data.current;
+
   // Breadcrumbs
-  const parts = data.current.split('/').filter(Boolean);
-  if (data.current.startsWith('\\\\') || data.current.includes(':\\')) {
-    // Windows
-    const bcHtml = parts.map((p,i) => {
-      const subpath = parts.slice(0,i+1).join('\\') + '\\';
-      return `<span onclick="navigateFileBrowser('${escAttr(subpath)}')">${esc(p)}</span> / `;
-    }).join('');
-    document.getElementById('file-breadcrumbs').innerHTML = bcHtml || data.current;
+  if (data.is_drives) {
+    document.getElementById('file-breadcrumbs').textContent = '此电脑';
+  } else if (data.current.includes(':\\') || data.current.startsWith('\\\\')) {
+    // Windows 路径 — 按反斜杠分割
+    const parts = data.current.split('\\').filter(Boolean);
+    let bcHtml = '<span onclick="navigateFileBrowser(\'\')">此电脑</span>';
+    for (let i = 0; i < parts.length; i++) {
+      const subpath = parts.slice(0, i + 1).join('\\') + (i === 0 ? '\\' : '');
+      bcHtml += ' \\ <span onclick="navigateFileBrowser(\'' + escAttr(subpath) + '\')">' + esc(parts[i]) + '</span>';
+    }
+    document.getElementById('file-breadcrumbs').innerHTML = bcHtml;
   } else {
+    // Linux 路径
+    const parts = data.current.split('/').filter(Boolean);
     let cum = '';
-    const bcHtml = parts.map((p,i) => {
+    let bcHtml = '<span onclick="navigateFileBrowser(\'/\')">/</span>';
+    parts.forEach((p, i) => {
       cum += '/' + p;
-      if (i === parts.length - 1) return esc(p);
-      return `<span onclick="navigateFileBrowser('${escAttr(cum)}')">${esc(p)}</span> / `;
-    }).join('');
-    document.getElementById('file-breadcrumbs').innerHTML = '<span onclick="navigateFileBrowser(\'/\')">/</span>' + (bcHtml?'/'+bcHtml:'');
+      if (i === parts.length - 1) {
+        bcHtml += esc(p);
+      } else {
+        bcHtml += '<span onclick="navigateFileBrowser(\'' + escAttr(cum) + '\')">' + esc(p) + '</span> / ';
+      }
+    });
+    document.getElementById('file-breadcrumbs').innerHTML = bcHtml;
   }
+
   // Entries
   let html = '';
-  if (data.parent) {
-    html += `<div class="entry dir" onclick="navigateFileBrowser('${escAttr(data.parent)}')"><span class="icon">📁</span>..</div>`;
+  if (data.parent !== null && data.parent !== undefined) {
+    html += '<div class="entry dir" onclick="navigateFileBrowser(\'' + escAttr(data.parent) + '\')"><span class="icon">📁</span>..</div>';
   }
   data.dirs.forEach(d => {
-    html += `<div class="entry dir" onclick="navigateFileBrowser('${escAttr(d.path)}')"><span class="icon">📁</span>${esc(d.name)}</div>`;
+    html += '<div class="entry dir" onclick="navigateFileBrowser(\'' + escAttr(d.path) + '\')"><span class="icon">📁</span>' + esc(d.name) + '</div>';
   });
   data.files.forEach(f => {
-    html += `<div class="entry file" onclick="selectFile('${escAttr(f.path)}')"><span class="icon">🐍</span>${esc(f.name)}</div>`;
+    html += '<div class="entry file" onclick="selectFile(\'' + escAttr(f.path) + '\')"><span class="icon">🐍</span>' + esc(f.name) + '</div>';
   });
-  if (data.dirs.length === 0 && data.files.length === 0 && data.parent) {
+  if (data.dirs.length === 0 && data.files.length === 0 && data.parent !== null && data.parent !== undefined) {
     html += '<div style="color:var(--text2);padding:12px;text-align:center">空目录</div>';
   }
   document.getElementById('file-browser-body').innerHTML = html;
