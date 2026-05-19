@@ -136,12 +136,16 @@ class QueueManager:
         })
 
     # ---- 日志缓冲区 ----
-    def append_log(self, task_id: str, stream: str, text: str):
+    def append_log(self, task_id: str, stream: str, text: str, is_progress: bool = False):
         if task_id not in self._log_buffers:
             self._log_buffers[task_id] = []
-        entry = {"ts": time.time(), "stream": stream, "text": text}
+        entry = {"ts": time.time(), "stream": stream, "text": text, "is_progress": is_progress}
         buf = self._log_buffers[task_id]
-        buf.append(entry)
+        # tqdm 进度行：替换上一条进度行而非新增
+        if is_progress and buf and buf[-1].get("is_progress"):
+            buf[-1] = entry
+        else:
+            buf.append(entry)
         if len(buf) > MAX_LOG_LINES:
             self._log_buffers[task_id] = buf[-MAX_LOG_LINES:]
 
@@ -333,6 +337,7 @@ class QueueManager:
                             break
 
                         line = buf[:term]
+                        is_progress = (term_char == "\r")
                         # 跳过跟在 \r 后面的 \n（处理 \r\n）
                         skip = 1
                         if term_char == "\r" and term + 1 < len(buf) and buf[term + 1] == "\n":
@@ -340,11 +345,12 @@ class QueueManager:
                         buf = buf[term + skip :]
 
                         if line:
-                            self.append_log(task.id, stream_name, line + "\n")
+                            self.append_log(task.id, stream_name, line + "\n", is_progress=is_progress)
                             await self.broadcast_log(task.id, {
                                 "ts": time.time(),
                                 "stream": stream_name,
                                 "text": line + "\n",
+                                "is_progress": is_progress,
                             })
                 # 输出剩余缓冲区
                 if buf:
@@ -792,6 +798,7 @@ main { display:flex; flex:1; overflow:hidden; }
 .log-viewer .log-stdout { color:var(--log-stdout); }
 .log-viewer .log-stderr { color:var(--red); }
 .log-viewer .log-system { color:var(--text2); font-style:italic; }
+.log-viewer .log-progress { border-left:2px solid var(--accent); padding-left:8px; }
 .log-empty { color:var(--text2); text-align:center; padding-top:80px; font-size:14px; }
 
 /* Add form */
@@ -968,7 +975,11 @@ function handleWSMessage(msg) {
     }
     case 'log':
       if (msg.task_id === activeTaskId) {
-        appendLogLine(msg.line);
+        if (msg.line.is_progress) {
+          upsertLogLine(msg.line);
+        } else {
+          appendLogLine(msg.line);
+        }
       }
       break;
     case 'log_history':
@@ -1042,7 +1053,7 @@ function renderLogHistory(logs) {
     return;
   }
   el.innerHTML = logs.map(l => {
-    const cls = 'log-' + (l.stream||'stdout');
+    const cls = 'log-' + (l.stream||'stdout') + (l.is_progress ? ' log-progress' : '');
     return `<div class="log-line ${cls}">${esc(l.text)}</div>`;
   }).join('');
   scrollLogToBottom();
@@ -1050,15 +1061,36 @@ function renderLogHistory(logs) {
 
 function appendLogLine(line) {
   const el = document.getElementById('log-viewer');
-  // 移除空状态
-  const empty = el.querySelector('.log-empty');
-  if (empty) empty.remove();
+  clearLogEmpty(el);
   const cls = 'log-' + (line.stream||'stdout');
   const div = document.createElement('div');
   div.className = 'log-line ' + cls;
   div.textContent = line.text;
   el.appendChild(div);
   scrollLogToBottom();
+}
+
+function upsertLogLine(line) {
+  // tqdm 进度行：替换上一条进度行，实现原地刷新效果
+  const el = document.getElementById('log-viewer');
+  clearLogEmpty(el);
+  const cls = 'log-' + (line.stream||'stdout') + ' log-progress';
+  const last = el.querySelector('.log-progress');
+  if (last) {
+    last.className = 'log-line ' + cls;
+    last.textContent = line.text;
+  } else {
+    const div = document.createElement('div');
+    div.className = 'log-line ' + cls;
+    div.textContent = line.text;
+    el.appendChild(div);
+  }
+  scrollLogToBottom();
+}
+
+function clearLogEmpty(el) {
+  const empty = el.querySelector('.log-empty');
+  if (empty) empty.remove();
 }
 
 function scrollLogToBottom() {
