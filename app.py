@@ -7,18 +7,19 @@
 import asyncio
 import json
 import os
+import shlex
 import signal
+import subprocess
 import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -119,11 +120,7 @@ class QueueManager:
             self._ws_clients.discard(ws)
 
     async def broadcast_state(self):
-        await self.broadcast({
-            "type": "queue_state",
-            "tasks": [t.to_dict() for t in self.tasks],
-            "running_task_id": self._running_task_id,
-        })
+        await self.broadcast(self.state_payload())
 
     async def broadcast_log(self, task_id: str, line: dict):
         await self.broadcast({
@@ -131,6 +128,13 @@ class QueueManager:
             "task_id": task_id,
             "line": line,
         })
+
+    def state_payload(self) -> dict:
+        return {
+            "type": "queue_state",
+            "tasks": [t.to_dict() for t in self.tasks],
+            "running_task_id": self._running_task_id,
+        }
 
     # ---- 日志缓冲区 ----
     def append_log(self, task_id: str, stream: str, text: str, is_progress: bool = False):
@@ -149,6 +153,23 @@ class QueueManager:
     def get_logs(self, task_id: str) -> list[dict]:
         return self._log_buffers.get(task_id, [])
 
+    async def append_and_broadcast_log(
+        self,
+        task_id: str,
+        stream: str,
+        text: str,
+        *,
+        is_progress: bool = False,
+    ):
+        entry = {
+            "ts": time.time(),
+            "stream": stream,
+            "text": text,
+            "is_progress": is_progress,
+        }
+        self.append_log(task_id, stream, text, is_progress=is_progress)
+        await self.broadcast_log(task_id, entry)
+
     # ---- 任务管理 ----
     def _find_index(self, task_id: str) -> int:
         for i, t in enumerate(self.tasks):
@@ -157,12 +178,31 @@ class QueueManager:
         return -1
 
     async def add_task(self, req: AddTaskRequest) -> Task:
+        name = req.name.strip()
+        if not name:
+            raise ValueError("任务名称不能为空")
+
+        script_path = req.script_path.strip()
+        if not script_path:
+            raise ValueError("请选择要执行的 Python 脚本")
+
+        script = Path(script_path).expanduser()
+        if not script.is_file():
+            raise ValueError(f"脚本不存在: {script}")
+
+        conda_env = req.conda_env.strip()
+        if conda_env:
+            python_executable = Path(self._resolve_python_executable(conda_env))
+            if not python_executable.is_file():
+                raise ValueError(f"所选环境中未找到 Python: {python_executable}")
+        self._parse_task_args(req.args.strip())
+
         task = Task(
             id=uuid.uuid4().hex[:8],
-            name=req.name,
-            conda_env=req.conda_env,
-            script_path=req.script_path,
-            args=req.args,
+            name=name,
+            conda_env=str(Path(conda_env).expanduser().resolve()) if conda_env else "",
+            script_path=str(script.resolve()),
+            args=req.args.strip(),
             created_at=time.time(),
         )
         async with self._lock:
@@ -186,8 +226,6 @@ class QueueManager:
                         self._current_process.kill()
             del self.tasks[idx]
         await self.broadcast_state()
-        if task.status == TaskStatus.RUNNING:
-            await self._try_start_next()
         return True
 
     async def reorder_tasks(self, task_ids: list[str]) -> bool:
@@ -235,7 +273,10 @@ class QueueManager:
         if proc and proc.returncode is None:
             try:
                 if sys.platform == "win32":
-                    proc.terminate()
+                    try:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                    except Exception:
+                        proc.terminate()
                 else:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except Exception:
@@ -252,20 +293,35 @@ class QueueManager:
                 except Exception:
                     pass
 
-    def _build_command(self, task: Task) -> str:
-        """构建完整的执行命令"""
-        if task.conda_env:
-            python = f"{task.conda_env}/bin/python"
-        else:
-            python = sys.executable
-        cmd = f"{python} {task.script_path}"
-        if task.args:
-            cmd += f" {task.args}"
-        return cmd
+    def _resolve_python_executable(self, conda_env: str) -> str:
+        env_dir = Path(conda_env).expanduser()
+        if sys.platform == "win32":
+            return str(env_dir / "python.exe")
+        return str(env_dir / "bin" / "python")
+
+    def _parse_task_args(self, args: str) -> list[str]:
+        if not args:
+            return []
+        try:
+            return shlex.split(args, posix=sys.platform != "win32")
+        except ValueError as exc:
+            raise ValueError(f"命令参数格式有误: {exc}") from exc
+
+    def _build_command(self, task: Task) -> list[str]:
+        python_executable = (
+            self._resolve_python_executable(task.conda_env)
+            if task.conda_env
+            else sys.executable
+        )
+        return [python_executable, task.script_path, *self._parse_task_args(task.args)]
+
+    def _format_command(self, command: list[str]) -> str:
+        if sys.platform == "win32":
+            return subprocess.list2cmdline(command)
+        return shlex.join(command)
 
     async def _run_task(self, task: Task):
         """执行单个任务（由 _try_start_next 调用）"""
-        cmd = self._build_command(task)
         task.status = TaskStatus.RUNNING
         task.started_at = time.time()
         self._running_task_id = task.id
@@ -273,32 +329,36 @@ class QueueManager:
         self._cancel_event = cancel_event
         await self.broadcast_state()
 
-        self.append_log(task.id, "system", f"[INFO] 开始执行: {cmd}\n")
-        await self.broadcast_log(task.id, {"ts": time.time(), "stream": "system", "text": f"开始执行: {cmd}\n"})
-
         try:
+            cmd = self._build_command(task)
+            command_display = self._format_command(cmd)
+            await self.append_and_broadcast_log(
+                task.id,
+                "system",
+                f"[INFO] 开始执行: {command_display}\n",
+            )
+
             # 设置环境变量，让 tqdm 等进度条库输出更适合日志查看
             child_env = {
                 **os.environ,
                 "PYTHONUNBUFFERED": "1",
                 "TQDM_MININTERVAL": "2",  # 最少 2 秒刷新一次，减少日志刷屏
             }
+            process_kwargs = {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "env": child_env,
+            }
             if sys.platform == "win32":
                 child_env["PYTHONIOENCODING"] = "utf-8"
-                proc = await asyncio.create_subprocess_exec(
-                    sys.executable, task.script_path, *task.args.split(),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=child_env,
+                process_kwargs["creationflags"] = getattr(
+                    subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0,
                 )
             else:
-                proc = await asyncio.create_subprocess_exec(
-                    "/bin/bash", "-c", cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    preexec_fn=os.setsid,
-                    env=child_env,
-                )
+                process_kwargs["start_new_session"] = True
+            proc = await asyncio.create_subprocess_exec(*cmd, **process_kwargs)
             self._current_process = proc
 
             def _decode(data: bytes) -> str:
@@ -342,21 +402,15 @@ class QueueManager:
                         buf = buf[term + skip :]
 
                         if line:
-                            self.append_log(task.id, stream_name, line + "\n", is_progress=is_progress)
-                            await self.broadcast_log(task.id, {
-                                "ts": time.time(),
-                                "stream": stream_name,
-                                "text": line + "\n",
-                                "is_progress": is_progress,
-                            })
+                            await self.append_and_broadcast_log(
+                                task.id,
+                                stream_name,
+                                line + "\n",
+                                is_progress=is_progress,
+                            )
                 # 输出剩余缓冲区
                 if buf:
-                    self.append_log(task.id, stream_name, buf + "\n")
-                    await self.broadcast_log(task.id, {
-                        "ts": time.time(),
-                        "stream": stream_name,
-                        "text": buf + "\n",
-                    })
+                    await self.append_and_broadcast_log(task.id, stream_name, buf + "\n")
 
             stdout_task = asyncio.create_task(read_stream(proc.stdout, "stdout"))
             stderr_task = asyncio.create_task(read_stream(proc.stderr, "stderr"))
@@ -371,7 +425,10 @@ class QueueManager:
                 # 用户取消了任务
                 try:
                     if sys.platform == "win32":
-                        proc.terminate()
+                        try:
+                            proc.send_signal(signal.CTRL_BREAK_EVENT)
+                        except Exception:
+                            proc.terminate()
                     else:
                         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except Exception:
@@ -385,19 +442,24 @@ class QueueManager:
                         pass
                     await proc.wait()
                 task.status = TaskStatus.CANCELLED
-                self.append_log(task.id, "system", "[INFO] 任务已被取消\n")
-                await self.broadcast_log(task.id, {"ts": time.time(), "stream": "system", "text": "任务已被取消\n"})
+                await self.append_and_broadcast_log(task.id, "system", "[INFO] 任务已被取消\n")
             else:
                 exit_code = proc.returncode
                 task.exit_code = exit_code
                 if exit_code == 0:
                     task.status = TaskStatus.COMPLETED
-                    self.append_log(task.id, "system", f"[INFO] 任务完成 (exit_code={exit_code})\n")
-                    await self.broadcast_log(task.id, {"ts": time.time(), "stream": "system", "text": f"任务完成 (exit_code={exit_code})\n"})
+                    await self.append_and_broadcast_log(
+                        task.id,
+                        "system",
+                        f"[INFO] 任务完成 (exit_code={exit_code})\n",
+                    )
                 else:
                     task.status = TaskStatus.FAILED
-                    self.append_log(task.id, "system", f"[ERROR] 任务失败 (exit_code={exit_code})\n")
-                    await self.broadcast_log(task.id, {"ts": time.time(), "stream": "system", "text": f"任务失败 (exit_code={exit_code})\n"})
+                    await self.append_and_broadcast_log(
+                        task.id,
+                        "system",
+                        f"[ERROR] 任务失败 (exit_code={exit_code})\n",
+                    )
 
             # 等待流读取完成
             for t in pending:
@@ -408,8 +470,7 @@ class QueueManager:
         except Exception as e:
             task.status = TaskStatus.FAILED
             task.exit_code = -1
-            self.append_log(task.id, "system", f"[ERROR] 执行异常: {e}\n")
-            await self.broadcast_log(task.id, {"ts": time.time(), "stream": "system", "text": f"执行异常: {e}\n"})
+            await self.append_and_broadcast_log(task.id, "system", f"[ERROR] 执行异常: {e}\n")
 
         finally:
             task.finished_at = time.time()
@@ -473,7 +534,10 @@ async def list_tasks():
 
 @app.post("/api/tasks")
 async def add_task(req: AddTaskRequest):
-    task = await queue.add_task(req)
+    try:
+        task = await queue.add_task(req)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return task.to_dict()
 
 
@@ -490,7 +554,6 @@ async def reorder_tasks(req: ReorderRequest):
     ok = await queue.reorder_tasks(req.task_ids)
     if not ok:
         raise HTTPException(400, "任务ID列表不匹配")
-    await queue.broadcast_state()
     return {"ok": True}
 
 
@@ -499,6 +562,8 @@ async def rerun_task(task_id: str):
     ok = await queue.rerun_task(task_id)
     if not ok:
         raise HTTPException(400, "仅已完成/失败/已取消的任务可重跑")
+    if queue._running_task_id is None:
+        await queue._try_start_next()
     return {"ok": True}
 
 
@@ -656,21 +721,13 @@ async def websocket_endpoint(ws: WebSocket):
     queue._ws_clients.add(ws)
     try:
         # 发送当前状态
-        await ws.send_text(json.dumps({
-            "type": "queue_state",
-            "tasks": [t.to_dict() for t in queue.tasks],
-            "running_task_id": queue._running_task_id,
-        }))
+        await ws.send_text(json.dumps(queue.state_payload()))
         # 保持连接
         while True:
             data = await ws.receive_text()
             msg = json.loads(data)
             if msg.get("type") == "get_state":
-                await ws.send_text(json.dumps({
-                    "type": "queue_state",
-                    "tasks": [t.to_dict() for t in queue.tasks],
-                    "running_task_id": queue._running_task_id,
-                }))
+                await ws.send_text(json.dumps(queue.state_payload()))
             elif msg.get("type") == "get_logs":
                 tid = msg.get("task_id")
                 if tid:
@@ -1005,7 +1062,7 @@ function renderTaskList() {
     const statusText = {pending:'等待',running:'运行中',completed:'完成',failed:'失败',cancelled:'已取消'}[t.status]||t.status;
     const isActive = t.id === activeTaskId;
     return `
-    <div class="task-card ${isActive?'active':''}" onclick="selectTask('${t.id}')">
+    <div class="task-card ${isActive?'active':''}" onclick="selectTask(${jsQuote(t.id)})">
       <div class="task-card-header">
         <span class="task-index">#${i+1}</span>
         <span class="task-name">${esc(t.name)}</span>
@@ -1013,17 +1070,17 @@ function renderTaskList() {
       </div>
       <div class="task-card-body">
         <div class="task-time">${taskTimeInfo(t)}</div>
-        ${t.conda_env ? '<div>🐍 ' + esc(t.conda_env.split('/').pop()||t.conda_env) + '</div>' : ''}
+        ${t.conda_env ? '<div>🐍 ' + esc(baseName(t.conda_env)) + '</div>' : ''}
         <div class="path">${esc(t.script_path)||'(无脚本)'}</div>
         ${t.args ? '<div>⚙ ' + esc(t.args) + '</div>' : ''}
         ${t.exit_code !== null && t.exit_code !== undefined ? '<div>退出码: ' + t.exit_code + '</div>' : ''}
       </div>
       <div class="task-card-actions" onclick="event.stopPropagation()">
-        ${t.status === 'running' ? '<button class="danger" onclick="cancelTask(\'' + t.id + '\')">⏹ 停止</button>' : ''}
-        ${t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled' ? '<button onclick="rerunTask(\'' + t.id + '\')">🔄 重跑</button>' : ''}
-        <button onclick="moveUp('${t.id}')" ${i===0?'disabled':''}>↑</button>
-        <button onclick="moveDown('${t.id}')" ${i===tasks.length-1?'disabled':''}>↓</button>
-        <button class="danger" onclick="deleteTask('${t.id}')">✕ 删除</button>
+        ${t.status === 'running' ? '<button class="danger" onclick="cancelTask(' + jsQuote(t.id) + ')">⏹ 停止</button>' : ''}
+        ${t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled' ? '<button onclick="rerunTask(' + jsQuote(t.id) + ')">🔄 重跑</button>' : ''}
+        <button onclick="moveUp(${jsQuote(t.id)})" ${i===0?'disabled':''}>↑</button>
+        <button onclick="moveDown(${jsQuote(t.id)})" ${i===tasks.length-1?'disabled':''}>↓</button>
+        <button class="danger" onclick="deleteTask(${jsQuote(t.id)})">✕ 删除</button>
       </div>
     </div>`;
   }).join('');
@@ -1113,6 +1170,7 @@ async function addTask() {
   const name = document.getElementById('input-name').value.trim();
   const script = selectedScript || document.getElementById('input-script').value.trim();
   if (!name) { toast('请输入任务名称'); return; }
+  if (!script) { toast('请选择要执行的 Python 脚本'); return; }
   const body = {
     name: name,
     conda_env: document.getElementById('input-env').value,
@@ -1127,7 +1185,7 @@ async function addTask() {
     selectedScript = '';
     toast('任务已添加');
   } else {
-    toast('添加失败');
+    toast(await getErrorMessage(resp, '添加失败'));
   }
 }
 
@@ -1138,19 +1196,19 @@ async function deleteTask(taskId) {
     if (activeTaskId === taskId) { activeTaskId = null; document.getElementById('log-viewer').innerHTML = '<div class="log-empty">选择一个任务查看日志</div>'; document.getElementById('log-panel-title').textContent = '运行日志'; }
     toast('任务已删除');
   } else {
-    toast('删除失败');
+    toast(await getErrorMessage(resp, '删除失败'));
   }
 }
 
 async function cancelTask(taskId) {
   if (!confirm('确认停止该任务？')) return;
-  await fetch('/api/tasks/' + taskId + '/cancel', {method:'POST'});
-  toast('已发送停止信号');
+  const resp = await fetch('/api/tasks/' + taskId + '/cancel', {method:'POST'});
+  toast(resp.ok ? '已发送停止信号' : await getErrorMessage(resp, '停止失败'));
 }
 
 async function rerunTask(taskId) {
-  await fetch('/api/tasks/' + taskId + '/rerun', {method:'POST'});
-  toast('已加入队列');
+  const resp = await fetch('/api/tasks/' + taskId + '/rerun', {method:'POST'});
+  toast(resp.ok ? '已加入队列' : await getErrorMessage(resp, '重跑失败'));
 }
 
 async function moveUp(taskId) {
@@ -1158,7 +1216,8 @@ async function moveUp(taskId) {
   if (idx <= 0) return;
   const ids = tasks.map(t => t.id);
   [ids[idx-1], ids[idx]] = [ids[idx], ids[idx-1]];
-  await fetch('/api/tasks/reorder', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_ids:ids})});
+  const resp = await fetch('/api/tasks/reorder', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_ids:ids})});
+  if (!resp.ok) toast(await getErrorMessage(resp, '上移失败'));
 }
 
 async function moveDown(taskId) {
@@ -1166,7 +1225,8 @@ async function moveDown(taskId) {
   if (idx < 0 || idx >= tasks.length-1) return;
   const ids = tasks.map(t => t.id);
   [ids[idx], ids[idx+1]] = [ids[idx+1], ids[idx]];
-  await fetch('/api/tasks/reorder', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_ids:ids})});
+  const resp = await fetch('/api/tasks/reorder', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_ids:ids})});
+  if (!resp.ok) toast(await getErrorMessage(resp, '下移失败'));
 }
 
 async function startFirstPending() {
@@ -1225,7 +1285,7 @@ async function navigateFileBrowser(path) {
     let bcHtml = '<span onclick="navigateFileBrowser(\'\')">此电脑</span>';
     for (let i = 0; i < parts.length; i++) {
       const subpath = parts.slice(0, i + 1).join('\\') + (i === 0 ? '\\' : '');
-      bcHtml += ' \\ <span onclick="navigateFileBrowser(\'' + escAttr(subpath) + '\')">' + esc(parts[i]) + '</span>';
+      bcHtml += ' \\ <span onclick="navigateFileBrowser(' + jsQuote(subpath) + ')">' + esc(parts[i]) + '</span>';
     }
     document.getElementById('file-breadcrumbs').innerHTML = bcHtml;
   } else {
@@ -1238,7 +1298,7 @@ async function navigateFileBrowser(path) {
       if (i === parts.length - 1) {
         bcHtml += esc(p);
       } else {
-        bcHtml += '<span onclick="navigateFileBrowser(\'' + escAttr(cum) + '\')">' + esc(p) + '</span> / ';
+        bcHtml += '<span onclick="navigateFileBrowser(' + jsQuote(cum) + ')">' + esc(p) + '</span> / ';
       }
     });
     document.getElementById('file-breadcrumbs').innerHTML = bcHtml;
@@ -1247,13 +1307,13 @@ async function navigateFileBrowser(path) {
   // Entries
   let html = '';
   if (data.parent !== null && data.parent !== undefined) {
-    html += '<div class="entry dir" onclick="navigateFileBrowser(\'' + escAttr(data.parent) + '\')"><span class="icon">📁</span>..</div>';
+    html += '<div class="entry dir" onclick="navigateFileBrowser(' + jsQuote(data.parent) + ')"><span class="icon">📁</span>..</div>';
   }
   data.dirs.forEach(d => {
-    html += '<div class="entry dir" onclick="navigateFileBrowser(\'' + escAttr(d.path) + '\')"><span class="icon">📁</span>' + esc(d.name) + '</div>';
+    html += '<div class="entry dir" onclick="navigateFileBrowser(' + jsQuote(d.path) + ')"><span class="icon">📁</span>' + esc(d.name) + '</div>';
   });
   data.files.forEach(f => {
-    html += '<div class="entry file" onclick="selectFile(\'' + escAttr(f.path) + '\')"><span class="icon">🐍</span>' + esc(f.name) + '</div>';
+    html += '<div class="entry file" onclick="selectFile(' + jsQuote(f.path) + ')"><span class="icon">🐍</span>' + esc(f.name) + '</div>';
   });
   if (data.dirs.length === 0 && data.files.length === 0 && data.parent !== null && data.parent !== undefined) {
     html += '<div style="color:var(--text2);padding:12px;text-align:center">空目录</div>';
@@ -1285,6 +1345,22 @@ function esc(s) {
 function escAttr(s) {
   if (!s) return '';
   return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/\\/g,'\\\\');
+}
+function jsQuote(s) {
+  return JSON.stringify(s ?? '');
+}
+function baseName(path) {
+  if (!path) return '';
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : path;
+}
+async function getErrorMessage(resp, fallback) {
+  try {
+    const data = await resp.json();
+    return data.detail || fallback;
+  } catch (e) {
+    return fallback;
+  }
 }
 function fmtTime(ts) {
   if (!ts) return '';
