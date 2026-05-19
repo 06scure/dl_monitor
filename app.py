@@ -28,13 +28,10 @@ if sys.platform == "win32":
     CONDA_SEARCH_PATHS = [
         "~/miniconda3/envs",
         "~/anaconda3/envs",
-        "~/miniconda3/Lib/site-packages",  # some installs
         "C:/ProgramData/miniconda3/envs",
         "C:/ProgramData/anaconda3/envs",
         "C:/Miniconda3/envs",
         "C:/Anaconda3/envs",
-        "C:/Users/*/miniconda3/envs",
-        "C:/Users/*/anaconda3/envs",
     ]
 else:
     CONDA_SEARCH_PATHS = [
@@ -531,6 +528,7 @@ async def start_queue():
 @app.get("/api/conda-envs")
 async def list_conda_envs():
     envs = []
+    seen = set()
     home = Path.home()
 
     for search_path in CONDA_SEARCH_PATHS:
@@ -554,12 +552,17 @@ async def list_conda_envs():
                     python_exe = env_dir / "python.exe"
                 else:
                     python_exe = env_dir / "bin" / "python"
-                if python_exe.is_file():
-                    envs.append({
-                        "name": env_dir.name,
-                        "path": str(env_dir),
-                        "python_path": str(python_exe),
-                    })
+                if not python_exe.is_file():
+                    continue
+                python_path = str(python_exe)
+                if python_path in seen:
+                    continue
+                seen.add(python_path)
+                envs.append({
+                    "name": env_dir.name,
+                    "path": str(env_dir),
+                    "python_path": python_path,
+                })
 
     # 当前Python环境
     envs.insert(0, {
@@ -881,7 +884,7 @@ main { display:flex; flex:1; overflow:hidden; }
       <div class="add-form" id="add-form">
         <div class="form-row">
           <label>名称</label>
-          <input id="input-name" placeholder="例如: train_vggt_exp1" onkeydown="if(event.key==='Enter')addTask()">
+          <input id="input-name" placeholder="例如: exp1" onkeydown="if(event.key==='Enter')addTask()">
         </div>
         <div class="form-row">
           <label>环境</label>
