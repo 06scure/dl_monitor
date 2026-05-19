@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -524,6 +524,11 @@ app = FastAPI(title="DL Training Monitor", version="1.0.0", lifespan=lifespan)
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_TEMPLATE
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
 
 
 # ---- 任务 API ----
@@ -1062,7 +1067,7 @@ function renderTaskList() {
     const statusText = {pending:'等待',running:'运行中',completed:'完成',failed:'失败',cancelled:'已取消'}[t.status]||t.status;
     const isActive = t.id === activeTaskId;
     return `
-    <div class="task-card ${isActive?'active':''}" onclick="selectTask(${jsQuote(t.id)})">
+    <div class="task-card ${isActive?'active':''}" onclick='selectTask(${jsQuote(t.id)})'>
       <div class="task-card-header">
         <span class="task-index">#${i+1}</span>
         <span class="task-name">${esc(t.name)}</span>
@@ -1076,11 +1081,11 @@ function renderTaskList() {
         ${t.exit_code !== null && t.exit_code !== undefined ? '<div>退出码: ' + t.exit_code + '</div>' : ''}
       </div>
       <div class="task-card-actions" onclick="event.stopPropagation()">
-        ${t.status === 'running' ? '<button class="danger" onclick="cancelTask(' + jsQuote(t.id) + ')">⏹ 停止</button>' : ''}
-        ${t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled' ? '<button onclick="rerunTask(' + jsQuote(t.id) + ')">🔄 重跑</button>' : ''}
-        <button onclick="moveUp(${jsQuote(t.id)})" ${i===0?'disabled':''}>↑</button>
-        <button onclick="moveDown(${jsQuote(t.id)})" ${i===tasks.length-1?'disabled':''}>↓</button>
-        <button class="danger" onclick="deleteTask(${jsQuote(t.id)})">✕ 删除</button>
+        ${t.status === 'running' ? '<button class="danger" onclick=\'cancelTask(' + jsQuote(t.id) + ')\'>⏹ 停止</button>' : ''}
+        ${t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled' ? '<button onclick=\'rerunTask(' + jsQuote(t.id) + ')\'>🔄 重跑</button>' : ''}
+        <button onclick='moveUp(${jsQuote(t.id)})' ${i===0?'disabled':''}>↑</button>
+        <button onclick='moveDown(${jsQuote(t.id)})' ${i===tasks.length-1?'disabled':''}>↓</button>
+        <button class="danger" onclick='deleteTask(${jsQuote(t.id)})'>✕ 删除</button>
       </div>
     </div>`;
   }).join('');
@@ -1282,23 +1287,23 @@ async function navigateFileBrowser(path) {
   } else if (data.current.includes(':\\') || data.current.startsWith('\\\\')) {
     // Windows 路径 — 按反斜杠分割
     const parts = data.current.split('\\').filter(Boolean);
-    let bcHtml = '<span onclick="navigateFileBrowser(\'\')">此电脑</span>';
+    let bcHtml = "<span onclick='navigateFileBrowser(\"\")'>此电脑</span>";
     for (let i = 0; i < parts.length; i++) {
       const subpath = parts.slice(0, i + 1).join('\\') + (i === 0 ? '\\' : '');
-      bcHtml += ' \\ <span onclick="navigateFileBrowser(' + jsQuote(subpath) + ')">' + esc(parts[i]) + '</span>';
+      bcHtml += " \\ <span onclick='navigateFileBrowser(" + jsQuote(subpath) + ")'>" + esc(parts[i]) + "</span>";
     }
     document.getElementById('file-breadcrumbs').innerHTML = bcHtml;
   } else {
     // Linux 路径
     const parts = data.current.split('/').filter(Boolean);
     let cum = '';
-    let bcHtml = '<span onclick="navigateFileBrowser(\'/\')">/</span>';
+    let bcHtml = "<span onclick='navigateFileBrowser(\"/\")'>/</span>";
     parts.forEach((p, i) => {
       cum += '/' + p;
       if (i === parts.length - 1) {
         bcHtml += esc(p);
       } else {
-        bcHtml += '<span onclick="navigateFileBrowser(' + jsQuote(cum) + ')">' + esc(p) + '</span> / ';
+        bcHtml += "<span onclick='navigateFileBrowser(" + jsQuote(cum) + ")'>" + esc(p) + "</span> / ";
       }
     });
     document.getElementById('file-breadcrumbs').innerHTML = bcHtml;
@@ -1307,13 +1312,13 @@ async function navigateFileBrowser(path) {
   // Entries
   let html = '';
   if (data.parent !== null && data.parent !== undefined) {
-    html += '<div class="entry dir" onclick="navigateFileBrowser(' + jsQuote(data.parent) + ')"><span class="icon">📁</span>..</div>';
+    html += "<div class='entry dir' onclick='navigateFileBrowser(" + jsQuote(data.parent) + ")'><span class='icon'>📁</span>..</div>";
   }
   data.dirs.forEach(d => {
-    html += '<div class="entry dir" onclick="navigateFileBrowser(' + jsQuote(d.path) + ')"><span class="icon">📁</span>' + esc(d.name) + '</div>';
+    html += "<div class='entry dir' onclick='navigateFileBrowser(" + jsQuote(d.path) + ")'><span class='icon'>📁</span>" + esc(d.name) + "</div>";
   });
   data.files.forEach(f => {
-    html += '<div class="entry file" onclick="selectFile(' + jsQuote(f.path) + ')"><span class="icon">🐍</span>' + esc(f.name) + '</div>';
+    html += "<div class='entry file' onclick='selectFile(" + jsQuote(f.path) + ")'><span class='icon'>🐍</span>" + esc(f.name) + "</div>";
   });
   if (data.dirs.length === 0 && data.files.length === 0 && data.parent !== null && data.parent !== undefined) {
     html += '<div style="color:var(--text2);padding:12px;text-align:center">空目录</div>';
