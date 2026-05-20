@@ -117,7 +117,6 @@ class QueueManager:
             f"{self._state_path.stem}.{os.getpid()}.tmp"
         )
         self._last_save_at = 0.0
-        self._state_dirty = False
         self._shutting_down = False
         self._load_state()
 
@@ -214,7 +213,6 @@ class QueueManager:
     def _persist_state(self, *, force: bool = True):
         now = time.time()
         if not force and now - self._last_save_at < SAVE_THROTTLE_SECONDS:
-            self._state_dirty = True
             return
         data = self._serialize_state()
         payload = json.dumps(data, ensure_ascii=False, indent=2)
@@ -223,7 +221,6 @@ class QueueManager:
                 self._state_tmp_path.write_text(payload, encoding="utf-8")
                 self._state_tmp_path.replace(self._state_path)
                 self._last_save_at = now
-                self._state_dirty = False
                 return
             except PermissionError:
                 if attempt == STATE_SAVE_RETRY_COUNT - 1:
@@ -611,7 +608,7 @@ class QueueManager:
             stderr_task = asyncio.create_task(read_stream(proc.stderr, "stderr"))
 
             # 等待进程结束或被取消
-            done, pending = await asyncio.wait(
+            _, pending = await asyncio.wait(
                 [asyncio.create_task(proc.wait()), asyncio.create_task(cancel_event.wait())],
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -755,12 +752,6 @@ async def cancel_task(task_id: str):
     if not ok:
         raise HTTPException(400, "任务未在运行")
     return {"ok": True}
-
-
-@app.get("/api/tasks/{task_id}/logs")
-async def get_task_logs(task_id: str):
-    return queue.get_logs(task_id)
-
 
 @app.post("/api/queue/start")
 async def start_queue():
@@ -908,9 +899,7 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             data = await ws.receive_text()
             msg = json.loads(data)
-            if msg.get("type") == "get_state":
-                await ws.send_text(json.dumps(queue.state_payload()))
-            elif msg.get("type") == "get_logs":
+            if msg.get("type") == "get_logs":
                 tid = msg.get("task_id")
                 if tid:
                     logs = queue.get_logs(tid)
@@ -1173,9 +1162,7 @@ let tasks = [];
 let activeTaskId = null;
 let ws = null;
 let wsReconnectTimer = null;
-let condaEnvs = [];
 let fileBrowserPath = '';
-let selectedScript = '';
 let logAutoScroll = true;
 
 // ---- WebSocket ----
@@ -1217,11 +1204,7 @@ function handleWSMessage(msg) {
     }
     case 'log':
       if (msg.task_id === activeTaskId) {
-        if (msg.line.is_progress) {
-          upsertLogLine(msg.line);
-        } else {
-          appendLogLine(msg.line);
-        }
+        renderIncomingLogLine(msg.line);
       }
       break;
     case 'log_history':
@@ -1301,28 +1284,10 @@ function renderLogHistory(logs) {
   scrollLogToBottom();
 }
 
-function appendLogLine(line) {
+function renderIncomingLogLine(line) {
   const el = document.getElementById('log-viewer');
   clearLogEmpty(el);
-  const cls = 'log-' + (line.stream||'stdout');
-  const last = el.lastElementChild;
-  if (last && last.classList.contains('log-progress') && last.classList.contains('log-' + (line.stream||'stdout'))) {
-    last.className = 'log-line ' + cls;
-    last.textContent = line.text;
-  } else {
-    const div = document.createElement('div');
-    div.className = 'log-line ' + cls;
-    div.textContent = line.text;
-    el.appendChild(div);
-  }
-  scrollLogToBottom();
-}
-
-function upsertLogLine(line) {
-  // tqdm 进度行：替换上一条进度行，实现原地刷新效果
-  const el = document.getElementById('log-viewer');
-  clearLogEmpty(el);
-  const cls = 'log-' + (line.stream||'stdout') + ' log-progress';
+  const cls = 'log-' + (line.stream||'stdout') + (line.is_progress ? ' log-progress' : '');
   const last = el.lastElementChild;
   if (last && last.classList.contains('log-progress') && last.classList.contains('log-' + (line.stream||'stdout'))) {
     last.className = 'log-line ' + cls;
@@ -1356,7 +1321,7 @@ document.getElementById('log-viewer').addEventListener('scroll', function() {
 // ---- Actions ----
 async function addTask() {
   const name = document.getElementById('input-name').value.trim();
-  const script = selectedScript || document.getElementById('input-script').value.trim();
+  const script = document.getElementById('input-script').value.trim();
   if (!name) { toast('请输入任务名称'); return; }
   if (!script) { toast('请选择要执行的 Python 脚本'); return; }
   const body = {
@@ -1370,7 +1335,6 @@ async function addTask() {
     document.getElementById('input-name').value = '';
     document.getElementById('input-script').value = '';
     document.getElementById('input-args').value = '';
-    selectedScript = '';
     toast('任务已添加');
   } else {
     toast(await getErrorMessage(resp, '添加失败'));
@@ -1399,22 +1363,22 @@ async function rerunTask(taskId) {
   toast(resp.ok ? '已加入队列' : await getErrorMessage(resp, '重跑失败'));
 }
 
-async function moveUp(taskId) {
+async function moveTask(taskId, delta) {
   const idx = tasks.findIndex(t => t.id === taskId);
-  if (idx <= 0) return;
+  const nextIdx = idx + delta;
+  if (idx < 0 || nextIdx < 0 || nextIdx >= tasks.length) return;
   const ids = tasks.map(t => t.id);
-  [ids[idx-1], ids[idx]] = [ids[idx], ids[idx-1]];
+  [ids[idx], ids[nextIdx]] = [ids[nextIdx], ids[idx]];
   const resp = await fetch('/api/tasks/reorder', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_ids:ids})});
-  if (!resp.ok) toast(await getErrorMessage(resp, '上移失败'));
+  if (!resp.ok) toast(await getErrorMessage(resp, delta < 0 ? '上移失败' : '下移失败'));
+}
+
+async function moveUp(taskId) {
+  await moveTask(taskId, -1);
 }
 
 async function moveDown(taskId) {
-  const idx = tasks.findIndex(t => t.id === taskId);
-  if (idx < 0 || idx >= tasks.length-1) return;
-  const ids = tasks.map(t => t.id);
-  [ids[idx], ids[idx+1]] = [ids[idx+1], ids[idx]];
-  const resp = await fetch('/api/tasks/reorder', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_ids:ids})});
-  if (!resp.ok) toast(await getErrorMessage(resp, '下移失败'));
+  await moveTask(taskId, 1);
 }
 
 async function startFirstPending() {
@@ -1438,9 +1402,9 @@ function toggleAddForm() {
 async function loadCondaEnvs() {
   try {
     const resp = await fetch('/api/conda-envs');
-    condaEnvs = await resp.json();
     const sel = document.getElementById('input-env');
-    sel.innerHTML = condaEnvs.map(e => `<option value="${escAttr(e.path)}">${esc(e.name)}</option>`).join('');
+    const envs = await resp.json();
+    sel.innerHTML = envs.map(e => `<option value="${escAttr(e.path)}">${esc(e.name)}</option>`).join('');
   } catch(e) {}
 }
 
@@ -1510,7 +1474,6 @@ async function navigateFileBrowser(path) {
 }
 
 function selectFile(path) {
-  selectedScript = path;
   document.getElementById('input-script').value = path;
   closeFileBrowser();
 }
