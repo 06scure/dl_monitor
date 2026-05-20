@@ -44,6 +44,9 @@ else:
     ]
 
 MAX_LOG_LINES = 2000  # 每个任务保留的最大日志行数
+SAVE_THROTTLE_SECONDS = 1.0
+APP_DIR = Path(__file__).resolve().parent
+STATE_FILE = APP_DIR / "queue_state.json"
 
 # ---------------------------------------------------------------------------
 # 数据模型
@@ -104,8 +107,14 @@ class QueueManager:
         self._current_process: Optional[asyncio.subprocess.Process] = None
         self._running_task_id: Optional[str] = None
         self._cancel_event: Optional[asyncio.Event] = None
+        self._runner_task: Optional[asyncio.Task] = None
         self._ws_clients: set[WebSocket] = set()
         self._lock = asyncio.Lock()
+        self._state_path = STATE_FILE
+        self._last_save_at = 0.0
+        self._state_dirty = False
+        self._shutting_down = False
+        self._load_state()
 
     # ---- WebSocket 广播 ----
     async def broadcast(self, message: dict):
@@ -149,6 +158,7 @@ class QueueManager:
             buf.append(entry)
         if len(buf) > MAX_LOG_LINES:
             self._log_buffers[task_id] = buf[-MAX_LOG_LINES:]
+        return entry
 
     def get_logs(self, task_id: str) -> list[dict]:
         return self._log_buffers.get(task_id, [])
@@ -161,14 +171,73 @@ class QueueManager:
         *,
         is_progress: bool = False,
     ):
-        entry = {
-            "ts": time.time(),
-            "stream": stream,
-            "text": text,
-            "is_progress": is_progress,
-        }
-        self.append_log(task_id, stream, text, is_progress=is_progress)
+        entry = self.append_log(task_id, stream, text, is_progress=is_progress)
+        self._persist_state(force=not is_progress)
         await self.broadcast_log(task_id, entry)
+
+    def _serialize_state(self) -> dict:
+        return {
+            "version": 1,
+            "saved_at": time.time(),
+            "tasks": [t.to_dict() for t in self.tasks],
+            "logs": self._log_buffers,
+        }
+
+    def _persist_state(self, *, force: bool = True):
+        now = time.time()
+        if not force and now - self._last_save_at < SAVE_THROTTLE_SECONDS:
+            self._state_dirty = True
+            return
+        data = self._serialize_state()
+        tmp_path = self._state_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self._state_path)
+        self._last_save_at = now
+        self._state_dirty = False
+
+    def _load_state(self):
+        if not self._state_path.is_file():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[WARN] Failed to load state file {self._state_path}: {exc}")
+            return
+
+        raw_tasks = payload.get("tasks", [])
+        raw_logs = payload.get("logs", {})
+        loaded_tasks: list[Task] = []
+        for item in raw_tasks:
+            try:
+                loaded_tasks.append(Task(**item))
+            except Exception as exc:
+                print(f"[WARN] Skipping invalid task record: {exc}")
+
+        self.tasks = loaded_tasks
+        self._log_buffers = {
+            str(task_id): logs[-MAX_LOG_LINES:]
+            for task_id, logs in raw_logs.items()
+            if isinstance(logs, list)
+        }
+
+        recovered = False
+        for task in self.tasks:
+            if task.status == TaskStatus.RUNNING:
+                task.status = TaskStatus.FAILED
+                task.exit_code = -2
+                task.finished_at = time.time()
+                self.append_log(
+                    task.id,
+                    "system",
+                    "[WARN] 服务重启后恢复队列，该任务原先处于运行中，当前已标记为失败；请确认原进程状态后再决定是否重跑。\n",
+                )
+                recovered = True
+        self._running_task_id = None
+        if recovered:
+            self._persist_state(force=True)
 
     # ---- 任务管理 ----
     def _find_index(self, task_id: str) -> int:
@@ -207,24 +276,33 @@ class QueueManager:
         )
         async with self._lock:
             self.tasks.append(task)
+            self._persist_state(force=True)
         await self.broadcast_state()
         return task
 
     async def remove_task(self, task_id: str) -> bool:
+        wait_for_process: Optional[asyncio.subprocess.Process] = None
+        cancel_event: Optional[asyncio.Event] = None
         async with self._lock:
             idx = self._find_index(task_id)
             if idx < 0:
                 return False
             task = self.tasks[idx]
             if task.status == TaskStatus.RUNNING:
-                await self._cancel_running()
-                # 等待进程退出
-                if self._current_process:
-                    try:
-                        await asyncio.wait_for(self._current_process.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        self._current_process.kill()
-            del self.tasks[idx]
+                wait_for_process = self._current_process
+                cancel_event = self._cancel_event
+            else:
+                del self.tasks[idx]
+                self._log_buffers.pop(task_id, None)
+                self._persist_state(force=True)
+        if wait_for_process:
+            await self._cancel_running(wait_for_process, cancel_event)
+            async with self._lock:
+                idx = self._find_index(task_id)
+                if idx >= 0:
+                    del self.tasks[idx]
+                    self._log_buffers.pop(task_id, None)
+                    self._persist_state(force=True)
         await self.broadcast_state()
         return True
 
@@ -234,6 +312,7 @@ class QueueManager:
                 return False
             id_to_task = {t.id: t for t in self.tasks}
             self.tasks = [id_to_task[tid] for tid in task_ids]
+            self._persist_state(force=True)
         await self.broadcast_state()
         return True
 
@@ -250,10 +329,13 @@ class QueueManager:
             task.started_at = None
             task.finished_at = None
             self._log_buffers.pop(task_id, None)
+            self._persist_state(force=True)
         await self.broadcast_state()
         return True
 
     async def cancel_task(self, task_id: str) -> bool:
+        proc: Optional[asyncio.subprocess.Process] = None
+        cancel_event: Optional[asyncio.Event] = None
         async with self._lock:
             idx = self._find_index(task_id)
             if idx < 0:
@@ -261,37 +343,100 @@ class QueueManager:
             task = self.tasks[idx]
             if task.status != TaskStatus.RUNNING:
                 return False
-            await self._cancel_running()
+            proc = self._current_process
+            cancel_event = self._cancel_event
+        await self._cancel_running(proc, cancel_event)
         return True
 
     # ---- 执行引擎 ----
-    async def _cancel_running(self):
+    async def _cancel_running(
+        self,
+        proc: Optional[asyncio.subprocess.Process] = None,
+        cancel_event: Optional[asyncio.Event] = None,
+    ):
         """终止当前运行的进程"""
-        if self._cancel_event:
-            self._cancel_event.set()
-        proc = self._current_process
+        if cancel_event:
+            cancel_event.set()
+        proc = proc or self._current_process
         if proc and proc.returncode is None:
+            await self._terminate_process(proc)
+
+    async def _run_windows_taskkill(self, pid: int):
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        except Exception:
+            pass
+
+    async def _terminate_process(self, proc: asyncio.subprocess.Process, timeout: float = 3.0):
+        if proc.returncode is not None:
+            return
+
+        if sys.platform == "win32":
             try:
-                if sys.platform == "win32":
-                    try:
-                        proc.send_signal(signal.CTRL_BREAK_EVENT)
-                    except Exception:
-                        proc.terminate()
-                else:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
             except Exception:
                 try:
                     proc.terminate()
                 except Exception:
                     pass
-            # 等待一秒后强制 kill
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout)
+                return
+            except asyncio.TimeoutError:
+                await self._run_windows_taskkill(proc.pid)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=3)
+                return
             except asyncio.TimeoutError:
                 try:
                     proc.kill()
                 except Exception:
                     pass
+                await proc.wait()
+            return
+
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        await proc.wait()
+
+    async def shutdown(self):
+        self._shutting_down = True
+        runner = self._runner_task
+        if self._current_process and self._current_process.returncode is None:
+            await self._cancel_running(self._current_process, self._cancel_event)
+        if runner:
+            try:
+                await runner
+            except Exception:
+                pass
+        async with self._lock:
+            self._persist_state(force=True)
 
     def _resolve_python_executable(self, conda_env: str) -> str:
         env_dir = Path(conda_env).expanduser()
@@ -324,9 +469,12 @@ class QueueManager:
         """执行单个任务（由 _try_start_next 调用）"""
         task.status = TaskStatus.RUNNING
         task.started_at = time.time()
+        task.finished_at = None
+        task.exit_code = None
         self._running_task_id = task.id
         cancel_event = asyncio.Event()
         self._cancel_event = cancel_event
+        self._persist_state(force=True)
         await self.broadcast_state()
 
         try:
@@ -336,6 +484,11 @@ class QueueManager:
                 task.id,
                 "system",
                 f"[INFO] 开始执行: {command_display}\n",
+            )
+            await self.append_and_broadcast_log(
+                task.id,
+                "system",
+                f"[INFO] 工作目录: {APP_DIR}\n",
             )
 
             # 设置环境变量，让 tqdm 等进度条库输出更适合日志查看
@@ -348,6 +501,7 @@ class QueueManager:
                 "stdout": asyncio.subprocess.PIPE,
                 "stderr": asyncio.subprocess.PIPE,
                 "env": child_env,
+                "cwd": str(APP_DIR),
             }
             if sys.platform == "win32":
                 child_env["PYTHONIOENCODING"] = "utf-8"
@@ -381,12 +535,22 @@ class QueueManager:
                         nl = buf.find("\n")
                         term = -1
                         term_char = ""
+                        is_progress = False
                         if cr != -1 and nl != -1:
-                            term = min(cr, nl)
-                            term_char = buf[term]
+                            if cr < nl:
+                                term = cr
+                                if cr + 1 < len(buf) and buf[cr + 1] == "\n":
+                                    term_char = "\r\n"
+                                else:
+                                    term_char = "\r"
+                                    is_progress = True
+                            else:
+                                term = nl
+                                term_char = "\n"
                         elif cr != -1:
                             term = cr
                             term_char = "\r"
+                            is_progress = True
                         elif nl != -1:
                             term = nl
                             term_char = "\n"
@@ -394,10 +558,9 @@ class QueueManager:
                             break
 
                         line = buf[:term]
-                        is_progress = (term_char == "\r")
-                        # 跳过跟在 \r 后面的 \n（处理 \r\n）
+                        # ???? \r ??? \n??? \r\n?
                         skip = 1
-                        if term_char == "\r" and term + 1 < len(buf) and buf[term + 1] == "\n":
+                        if term_char == "\r\n":
                             skip = 2
                         buf = buf[term + skip :]
 
@@ -423,25 +586,9 @@ class QueueManager:
 
             if cancel_event.is_set():
                 # 用户取消了任务
-                try:
-                    if sys.platform == "win32":
-                        try:
-                            proc.send_signal(signal.CTRL_BREAK_EVENT)
-                        except Exception:
-                            proc.terminate()
-                    else:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except Exception:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=3)
-                except asyncio.TimeoutError:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    await proc.wait()
+                await self._terminate_process(proc)
                 task.status = TaskStatus.CANCELLED
+                task.exit_code = None
                 await self.append_and_broadcast_log(task.id, "system", "[INFO] 任务已被取消\n")
             else:
                 exit_code = proc.returncode
@@ -477,9 +624,12 @@ class QueueManager:
             self._current_process = None
             self._running_task_id = None
             self._cancel_event = None
+            self._persist_state(force=True)
             await self.broadcast_state()
+            self._runner_task = None
             # 自动启动下一个任务
-            await self._try_start_next()
+            if not self._shutting_down:
+                await self._try_start_next()
 
     async def _try_start_next(self) -> bool:
         """启动队列中下一个待执行的任务。返回 True 表示找到了待执行任务。"""
@@ -494,7 +644,7 @@ class QueueManager:
             else:
                 return False  # 没有待执行的任务
 
-        asyncio.create_task(self._run_task(task))
+        self._runner_task = asyncio.create_task(self._run_task(task))
         return True
 
 
@@ -508,15 +658,10 @@ queue = QueueManager()
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    yield
-    if queue._current_process and queue._current_process.returncode is None:
-        try:
-            if sys.platform == "win32":
-                queue._current_process.terminate()
-            else:
-                os.killpg(os.getpgid(queue._current_process.pid), signal.SIGTERM)
-        except Exception:
-            pass
+    try:
+        yield
+    finally:
+        await queue.shutdown()
 
 app = FastAPI(title="DL Training Monitor", version="1.0.0", lifespan=lifespan)
 
@@ -1140,7 +1285,8 @@ function upsertLogLine(line) {
   const el = document.getElementById('log-viewer');
   clearLogEmpty(el);
   const cls = 'log-' + (line.stream||'stdout') + ' log-progress';
-  const last = el.querySelector('.log-progress');
+  const progressLines = el.querySelectorAll('.log-progress');
+  const last = progressLines.length ? progressLines[progressLines.length - 1] : null;
   if (last) {
     last.className = 'log-line ' + cls;
     last.textContent = line.text;
@@ -1427,6 +1573,6 @@ if __name__ == "__main__":
     import uvicorn
     print("=" * 50)
     print("  深度学习训练任务队列监控")
-    print("  打开浏览器访问: http://localhost:8000")
+    print("  打开浏览器访问: http://127.0.0.1:8000")
     print("=" * 50)
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
