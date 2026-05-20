@@ -47,6 +47,8 @@ MAX_LOG_LINES = 2000  # 每个任务保留的最大日志行数
 SAVE_THROTTLE_SECONDS = 1.0
 APP_DIR = Path(__file__).resolve().parent
 STATE_FILE = APP_DIR / "queue_state.json"
+STATE_SAVE_RETRY_COUNT = 3
+STATE_SAVE_RETRY_DELAY = 0.05
 
 # ---------------------------------------------------------------------------
 # 数据模型
@@ -111,6 +113,9 @@ class QueueManager:
         self._ws_clients: set[WebSocket] = set()
         self._lock = asyncio.Lock()
         self._state_path = STATE_FILE
+        self._state_tmp_path = self._state_path.with_name(
+            f"{self._state_path.stem}.{os.getpid()}.tmp"
+        )
         self._last_save_at = 0.0
         self._state_dirty = False
         self._shutting_down = False
@@ -146,13 +151,36 @@ class QueueManager:
         }
 
     # ---- 日志缓冲区 ----
+    def _progress_series_key(self, text: str) -> str:
+        if "|" not in text:
+            return ""
+        return text.split("|", 1)[0].strip()
+
+    def _is_same_progress_series(self, prev_text: str, next_text: str) -> bool:
+        prev_key = self._progress_series_key(prev_text)
+        next_key = self._progress_series_key(next_text)
+        return bool(prev_key) and prev_key == next_key
+
     def append_log(self, task_id: str, stream: str, text: str, is_progress: bool = False):
         if task_id not in self._log_buffers:
             self._log_buffers[task_id] = []
         entry = {"ts": time.time(), "stream": stream, "text": text, "is_progress": is_progress}
         buf = self._log_buffers[task_id]
         # tqdm 进度行：替换上一条进度行而非新增
-        if is_progress and buf and buf[-1].get("is_progress"):
+        if (
+            is_progress
+            and buf
+            and buf[-1].get("is_progress")
+            and buf[-1].get("stream") == stream
+        ):
+            buf[-1] = entry
+        elif (
+            not is_progress
+            and buf
+            and buf[-1].get("is_progress")
+            and buf[-1].get("stream") == stream
+            and self._is_same_progress_series(buf[-1].get("text", ""), text)
+        ):
             buf[-1] = entry
         else:
             buf.append(entry)
@@ -189,14 +217,18 @@ class QueueManager:
             self._state_dirty = True
             return
         data = self._serialize_state()
-        tmp_path = self._state_path.with_suffix(".tmp")
-        tmp_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp_path.replace(self._state_path)
-        self._last_save_at = now
-        self._state_dirty = False
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        for attempt in range(STATE_SAVE_RETRY_COUNT):
+            try:
+                self._state_tmp_path.write_text(payload, encoding="utf-8")
+                self._state_tmp_path.replace(self._state_path)
+                self._last_save_at = now
+                self._state_dirty = False
+                return
+            except PermissionError:
+                if attempt == STATE_SAVE_RETRY_COUNT - 1:
+                    raise
+                time.sleep(STATE_SAVE_RETRY_DELAY)
 
     def _load_state(self):
         if not self._state_path.is_file():
