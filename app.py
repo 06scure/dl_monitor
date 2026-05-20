@@ -50,6 +50,13 @@ STATE_FILE = APP_DIR / "queue_state.json"
 STATE_SAVE_RETRY_COUNT = 3
 STATE_SAVE_RETRY_DELAY = 0.05
 
+
+def resolve_python_executable(conda_env: str) -> str:
+    env_dir = Path(conda_env).expanduser()
+    if sys.platform == "win32":
+        return str(env_dir / "python.exe")
+    return str(env_dir / "bin" / "python")
+
 # ---------------------------------------------------------------------------
 # 数据模型
 # ---------------------------------------------------------------------------
@@ -135,13 +142,6 @@ class QueueManager:
     async def broadcast_state(self):
         await self.broadcast(self.state_payload())
 
-    async def broadcast_log(self, task_id: str, line: dict):
-        await self.broadcast({
-            "type": "log",
-            "task_id": task_id,
-            "line": line,
-        })
-
     def state_payload(self) -> dict:
         return {
             "type": "queue_state",
@@ -161,10 +161,8 @@ class QueueManager:
         return bool(prev_key) and prev_key == next_key
 
     def append_log(self, task_id: str, stream: str, text: str, is_progress: bool = False):
-        if task_id not in self._log_buffers:
-            self._log_buffers[task_id] = []
         entry = {"ts": time.time(), "stream": stream, "text": text, "is_progress": is_progress}
-        buf = self._log_buffers[task_id]
+        buf = self._log_buffers.setdefault(task_id, [])
         # tqdm 进度行：替换上一条进度行而非新增
         if (
             is_progress
@@ -200,7 +198,11 @@ class QueueManager:
     ):
         entry = self.append_log(task_id, stream, text, is_progress=is_progress)
         self._persist_state(force=not is_progress)
-        await self.broadcast_log(task_id, entry)
+        await self.broadcast({
+            "type": "log",
+            "task_id": task_id,
+            "line": entry,
+        })
 
     def _serialize_state(self) -> dict:
         return {
@@ -275,6 +277,19 @@ class QueueManager:
                 return i
         return -1
 
+    def _remove_task_at(self, idx: int):
+        task = self.tasks.pop(idx)
+        self._log_buffers.pop(task.id, None)
+        self._persist_state(force=True)
+
+    def _reset_task_for_rerun(self, task: Task):
+        task.status = TaskStatus.PENDING
+        task.exit_code = None
+        task.started_at = None
+        task.finished_at = None
+        self._log_buffers.pop(task.id, None)
+        self._persist_state(force=True)
+
     async def add_task(self, req: AddTaskRequest) -> Task:
         name = req.name.strip()
         if not name:
@@ -290,7 +305,7 @@ class QueueManager:
 
         conda_env = req.conda_env.strip()
         if conda_env:
-            python_executable = Path(self._resolve_python_executable(conda_env))
+            python_executable = Path(resolve_python_executable(conda_env))
             if not python_executable.is_file():
                 raise ValueError(f"所选环境中未找到 Python: {python_executable}")
         self._parse_task_args(req.args.strip())
@@ -321,17 +336,13 @@ class QueueManager:
                 wait_for_process = self._current_process
                 cancel_event = self._cancel_event
             else:
-                del self.tasks[idx]
-                self._log_buffers.pop(task_id, None)
-                self._persist_state(force=True)
+                self._remove_task_at(idx)
         if wait_for_process:
             await self._cancel_running(wait_for_process, cancel_event)
             async with self._lock:
                 idx = self._find_index(task_id)
                 if idx >= 0:
-                    del self.tasks[idx]
-                    self._log_buffers.pop(task_id, None)
-                    self._persist_state(force=True)
+                    self._remove_task_at(idx)
         await self.broadcast_state()
         return True
 
@@ -353,12 +364,7 @@ class QueueManager:
             task = self.tasks[idx]
             if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
                 return False
-            task.status = TaskStatus.PENDING
-            task.exit_code = None
-            task.started_at = None
-            task.finished_at = None
-            self._log_buffers.pop(task_id, None)
-            self._persist_state(force=True)
+            self._reset_task_for_rerun(task)
         await self.broadcast_state()
         return True
 
@@ -467,12 +473,6 @@ class QueueManager:
         async with self._lock:
             self._persist_state(force=True)
 
-    def _resolve_python_executable(self, conda_env: str) -> str:
-        env_dir = Path(conda_env).expanduser()
-        if sys.platform == "win32":
-            return str(env_dir / "python.exe")
-        return str(env_dir / "bin" / "python")
-
     def _parse_task_args(self, args: str) -> list[str]:
         if not args:
             return []
@@ -483,7 +483,7 @@ class QueueManager:
 
     def _build_command(self, task: Task) -> list[str]:
         python_executable = (
-            self._resolve_python_executable(task.conda_env)
+            resolve_python_executable(task.conda_env)
             if task.conda_env
             else sys.executable
         )
@@ -706,11 +706,6 @@ async def favicon():
 
 
 # ---- 任务 API ----
-@app.get("/api/tasks")
-async def list_tasks():
-    return [t.to_dict() for t in queue.tasks]
-
-
 @app.post("/api/tasks")
 async def add_task(req: AddTaskRequest):
     try:
@@ -786,10 +781,7 @@ async def list_conda_envs():
                 if not env_dir.is_dir():
                     continue
                 # 平台相关的 python 路径
-                if sys.platform == "win32":
-                    python_exe = env_dir / "python.exe"
-                else:
-                    python_exe = env_dir / "bin" / "python"
+                python_exe = Path(resolve_python_executable(str(env_dir)))
                 if not python_exe.is_file():
                     continue
                 python_path = str(python_exe)
@@ -799,14 +791,12 @@ async def list_conda_envs():
                 envs.append({
                     "name": env_dir.name,
                     "path": str(env_dir),
-                    "python_path": python_path,
                 })
 
     # 当前Python环境
     envs.insert(0, {
         "name": "系统默认 (当前Python)",
         "path": "",
-        "python_path": sys.executable,
     })
 
     return envs
@@ -1243,8 +1233,8 @@ function renderTaskList() {
       <div class="task-card-actions" onclick="event.stopPropagation()">
         ${t.status === 'running' ? '<button class="danger" onclick=\'cancelTask(' + jsQuote(t.id) + ')\'>⏹ 停止</button>' : ''}
         ${t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled' ? '<button onclick=\'rerunTask(' + jsQuote(t.id) + ')\'>🔄 重跑</button>' : ''}
-        <button onclick='moveUp(${jsQuote(t.id)})' ${i===0?'disabled':''}>↑</button>
-        <button onclick='moveDown(${jsQuote(t.id)})' ${i===tasks.length-1?'disabled':''}>↓</button>
+        <button onclick='moveTask(${jsQuote(t.id)}, -1)' ${i===0?'disabled':''}>↑</button>
+        <button onclick='moveTask(${jsQuote(t.id)}, 1)' ${i===tasks.length-1?'disabled':''}>↓</button>
         <button class="danger" onclick='deleteTask(${jsQuote(t.id)})'>✕ 删除</button>
       </div>
     </div>`;
@@ -1371,14 +1361,6 @@ async function moveTask(taskId, delta) {
   [ids[idx], ids[nextIdx]] = [ids[nextIdx], ids[idx]];
   const resp = await fetch('/api/tasks/reorder', {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_ids:ids})});
   if (!resp.ok) toast(await getErrorMessage(resp, delta < 0 ? '上移失败' : '下移失败'));
-}
-
-async function moveUp(taskId) {
-  await moveTask(taskId, -1);
-}
-
-async function moveDown(taskId) {
-  await moveTask(taskId, 1);
 }
 
 async function startFirstPending() {
