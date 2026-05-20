@@ -1305,10 +1305,16 @@ function appendLogLine(line) {
   const el = document.getElementById('log-viewer');
   clearLogEmpty(el);
   const cls = 'log-' + (line.stream||'stdout');
-  const div = document.createElement('div');
-  div.className = 'log-line ' + cls;
-  div.textContent = line.text;
-  el.appendChild(div);
+  const last = el.lastElementChild;
+  if (last && last.classList.contains('log-progress') && last.classList.contains('log-' + (line.stream||'stdout'))) {
+    last.className = 'log-line ' + cls;
+    last.textContent = line.text;
+  } else {
+    const div = document.createElement('div');
+    div.className = 'log-line ' + cls;
+    div.textContent = line.text;
+    el.appendChild(div);
+  }
   scrollLogToBottom();
 }
 
@@ -1317,9 +1323,8 @@ function upsertLogLine(line) {
   const el = document.getElementById('log-viewer');
   clearLogEmpty(el);
   const cls = 'log-' + (line.stream||'stdout') + ' log-progress';
-  const progressLines = el.querySelectorAll('.log-progress');
-  const last = progressLines.length ? progressLines[progressLines.length - 1] : null;
-  if (last) {
+  const last = el.lastElementChild;
+  if (last && last.classList.contains('log-progress') && last.classList.contains('log-' + (line.stream||'stdout'))) {
     last.className = 'log-line ' + cls;
     last.textContent = line.text;
   } else {
