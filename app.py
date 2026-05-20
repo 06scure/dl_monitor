@@ -46,7 +46,7 @@ else:
 MAX_LOG_LINES = 2000  # 每个任务保留的最大日志行数
 SAVE_THROTTLE_SECONDS = 1.0
 APP_DIR = Path(__file__).resolve().parent
-STATE_FILE = APP_DIR / "queue_state.json"
+STATE_FILE = APP_DIR / "log.json"
 STATE_SAVE_RETRY_COUNT = 3
 STATE_SAVE_RETRY_DELAY = 0.05
 
