@@ -494,6 +494,9 @@ class QueueManager:
             return subprocess.list2cmdline(command)
         return shlex.join(command)
 
+    def _task_workdir(self, task: Task) -> str:
+        return str(Path(task.script_path).resolve().parent)
+
     async def _run_task(self, task: Task):
         """执行单个任务（由 _try_start_next 调用）"""
         task.status = TaskStatus.RUNNING
@@ -508,6 +511,7 @@ class QueueManager:
 
         try:
             cmd = self._build_command(task)
+            task_workdir = self._task_workdir(task)
             command_display = self._format_command(cmd)
             await self.append_and_broadcast_log(
                 task.id,
@@ -517,7 +521,7 @@ class QueueManager:
             await self.append_and_broadcast_log(
                 task.id,
                 "system",
-                f"[INFO] 工作目录: {APP_DIR}\n",
+                f"[INFO] 工作目录: {task_workdir}\n",
             )
 
             # 设置环境变量，让 tqdm 等进度条库输出更适合日志查看
@@ -530,7 +534,7 @@ class QueueManager:
                 "stdout": asyncio.subprocess.PIPE,
                 "stderr": asyncio.subprocess.PIPE,
                 "env": child_env,
-                "cwd": str(APP_DIR),
+                "cwd": task_workdir,
             }
             if sys.platform == "win32":
                 child_env["PYTHONIOENCODING"] = "utf-8"
